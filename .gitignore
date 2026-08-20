@@ -1,2 +1,5 @@
 node_modules/
 .DS_Store
+
+# release archives, never part of the source
+*.tar.gz
