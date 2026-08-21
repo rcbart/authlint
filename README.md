@@ -4,6 +4,8 @@
 
 [Use it →](https://roniam.dev/authlint/) · [Full guide →](USAGE.md)
 
+![authlint showing findings on a broken SAML response](docs/findings.png)
+
 authlint reads JSON Web Tokens, JWKS documents, OpenID Connect discovery
 documents, OAuth 2.0 authorization requests and redirects, SAML responses and
 SAML metadata. You do not tell it which one you have. It works that out, decodes
