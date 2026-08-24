@@ -21,15 +21,19 @@ function detect(raw) {
   const text = String(raw || '').trim();
   if (!text) return { kind: null };
 
-  // A JWT is three or five base64url segments. Check this first: it is the
-  // most common paste and the least ambiguous shape there is.
+  // A bearer header pasted whole, which people do constantly. This must be
+  // tested BEFORE the bare-JWT shape below: that test strips whitespace so a
+  // wrapped token still matches, which also turns "Bearer eyJ..." into
+  // "BearereyJ...", a string made entirely of base64url characters. Ordered the
+  // other way round, a bare Bearer paste matches as a JWT with no rewrite and
+  // the prefix is carried into the decoder.
+  const bearer = text.match(/^(?:Authorization:\s*)?Bearer\s+([A-Za-z0-9_.-]+)$/i);
+  if (bearer) return { kind: 'jwt', confidence: 'certain', rewrite: bearer[1] };
+
+  // A JWT is three or five base64url segments.
   if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]*){1,3}$/.test(text.replace(/\s+/g, ''))) {
     return { kind: 'jwt', confidence: 'certain' };
   }
-
-  // A bearer header pasted whole, which people do constantly.
-  const bearer = text.match(/^(?:Authorization:\s*)?Bearer\s+([A-Za-z0-9_.-]+)$/i);
-  if (bearer) return { kind: 'jwt', confidence: 'certain', rewrite: bearer[1] };
 
   // A URL: either an authorization request or a redirect carrying the result.
   if (/^https?:\/\//i.test(text) && /[?#]/.test(text)) {

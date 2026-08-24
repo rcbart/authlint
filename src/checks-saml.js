@@ -171,6 +171,71 @@ function checkSamlResponse(x, now) {
       'Destination check.', '', 'SAML 2.0 Core §2.4.1.2'));
   }
 
+  /* ---------------- the ACS URL ----------------
+     Destination and Recipient should both name the same endpoint: your ACS.
+     This is the single most common cause of a SAML login that fails with
+     nothing useful in the log, and it is almost always cosmetic, one trailing
+     slash or one wrong scheme. authlint cannot know your configured ACS, but
+     the response carries the value twice and the two copies have to agree. */
+  const recip = scd && attr(scd, 'Recipient');
+  const urlShape = u => {
+    const t = String(u || '').trim();
+    if (!t) return null;
+    if (!/^https?:\/\//i.test(t)) return { bad: 'no scheme' };
+    try {
+      const p = new URL(t);
+      return { url: p, canon: p.protocol.toLowerCase() + '//' + p.host.toLowerCase() +
+                            p.pathname.replace(/\/+$/, '') + p.search };
+    } catch (e) { return { bad: 'not a valid URL' }; }
+  };
+  for (const [label, raw] of [['Destination', dest], ['Recipient', recip]]) {
+    if (!raw) continue;
+    if (raw !== String(raw).trim()) {
+      f.push(F('warn', label + ' has leading or trailing whitespace',
+        'Service providers compare this against the configured ACS URL as a string, and the ' +
+        'whitespace is invisible in every log you will read while trying to work out why.',
+        'Trim the value in the identity provider configuration.', 'SAML 2.0 Core §3.2.2'));
+    }
+    const sh = urlShape(raw);
+    if (sh && sh.bad) {
+      f.push(F('critical', label + ' is not an absolute URL (' + sh.bad + ')',
+        'It has to be an absolute URI. A bare host or path will never match the ACS URL the ' +
+        'service provider has configured, so sign-on fails before anything is validated.',
+        'Set ' + label + ' to the full https URL of the assertion consumer service.',
+        'SAML 2.0 Core §3.2.2'));
+    } else if (sh && sh.url && sh.url.protocol === 'http:') {
+      f.push(F('critical', label + ' is http, not https',
+        'The assertion travels through the browser to this endpoint. Over http it is readable and ' +
+        'replayable by anything on the path.',
+        'Use https for the assertion consumer service.', 'SAML 2.0 Core §3.2.2'));
+    }
+  }
+  if (dest && recip) {
+    const a = urlShape(dest), b = urlShape(recip);
+    if (a && b && a.canon && b.canon) {
+      if (a.canon !== b.canon) {
+        const sameHost = a.url.host.toLowerCase() === b.url.host.toLowerCase();
+        f.push(F('critical', 'Destination and Recipient do not point at the same endpoint',
+          'The response says it was issued for ' + dest.trim() + ' and the assertion says it may ' +
+          'only be consumed at ' + String(recip).trim() + '. ' + (sameHost
+            ? 'The paths differ, so one of the two is configured against a stale endpoint.'
+            : 'They are different hosts, which is what a redirected or replayed assertion looks like.'),
+          'Make both match the ACS URL the service provider has configured, exactly.',
+          'SAML 2.0 Core §3.2.2 and §2.4.1.2'));
+      } else if (String(dest).trim() !== String(recip).trim()) {
+        f.push(F('warn', 'Destination and Recipient differ only in formatting',
+          'They resolve to the same endpoint, but the strings are not identical: ' +
+          String(dest).trim() + ' against ' + String(recip).trim() + '. Most service providers ' +
+          'compare the ACS URL as a string, so a trailing slash or an explicit :443 is enough to ' +
+          'fail the match while looking correct to a human.',
+          'Make both byte-identical to the configured ACS URL.',
+          'SAML 2.0 Core §3.2.2 and §2.4.1.2'));
+      } else {
+        f.push(F('ok', 'Destination and Recipient agree', ''));
+      }
+    }
+  }
+
   /* ---------------- the subject ---------------- */
   const nameId = el(root, 'NameID');
   if (nameId) {

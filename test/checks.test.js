@@ -27,6 +27,20 @@ test('a Bearer header is unwrapped before decoding', () => {
   assert.ok(d.rewrite && d.rewrite.split('.').length === 3);
 });
 
+/* A bare "Bearer <token>" is the most common paste of all, and it is the one
+   the shape test can swallow: that test strips whitespace so a wrapped token
+   still matches, which also turns "Bearer eyJ..." into a string made entirely
+   of base64url characters. Every accepted spelling has to reach the decoder. */
+test('a bare Bearer prefix is stripped, in any casing', () => {
+  const token = jwt({ alg: 'RS256' }, good);
+  for (const prefix of ['Bearer ', 'bearer ', 'BEARER ', 'Bearer  ', 'Authorization: Bearer ']) {
+    const d = detect(prefix + token);
+    assert.strictEqual(d.kind, 'jwt', prefix);
+    assert.strictEqual(d.rewrite, token, prefix);
+    assert.ok(!decodeJwt(d.rewrite).error, prefix);
+  }
+});
+
 /* ------------------------------ JWT ------------------------------ */
 
 test('alg none is critical', () => {
@@ -267,6 +281,55 @@ test('two assertions and duplicate ids', () => {
   assert.ok(has(saml({ assertionSigned: true, secondAssertion: true }), 'critical', '2 assertions'));
   const dup = checkSamlResponse(decodeXml(SAML({ assertionSigned: true }).replace('ID="_r1"', 'ID="_a1"')), 1800000000);
   assert.ok(has(dup, 'critical', 'duplicate id'));
+});
+
+/* A minimal signed response whose only variables are the two places the ACS
+   URL appears. Everything else is deliberately clean so the ACS findings are
+   the only interesting output. */
+function samlAcs(dest, recip) {
+  const t = s => new Date(s * 1000).toISOString();
+  return '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ' +
+    'xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r1" Version="2.0" ' +
+    'IssueInstant="' + t(NOW) + '" Destination="' + dest + '">' +
+    '<saml:Issuer>https://idp.example.com/</saml:Issuer>' +
+    '<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>' +
+    '<saml:Assertion ID="_a1" IssueInstant="' + t(NOW) + '" Version="2.0">' +
+    '<saml:Issuer>https://idp.example.com/</saml:Issuer>' +
+    '<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>' +
+    '<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>' +
+    '<ds:Reference URI="#_a1"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>' +
+    '<ds:DigestValue>x=</ds:DigestValue></ds:Reference></ds:SignedInfo>' +
+    '<ds:SignatureValue>c2ln</ds:SignatureValue></ds:Signature>' +
+    '<saml:Subject><saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">_u1</saml:NameID>' +
+    '<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">' +
+    '<saml:SubjectConfirmationData NotOnOrAfter="' + t(NOW + 300) + '" Recipient="' + recip + '"/>' +
+    '</saml:SubjectConfirmation></saml:Subject>' +
+    '<saml:Conditions NotBefore="' + t(NOW - 300) + '" NotOnOrAfter="' + t(NOW + 300) + '">' +
+    '<saml:AudienceRestriction><saml:Audience>https://sp.example.com/metadata</saml:Audience>' +
+    '</saml:AudienceRestriction></saml:Conditions></saml:Assertion></samlp:Response>';
+}
+
+/* The ACS URL is the most common cause of a SAML login that fails with nothing
+   useful in the log, and it is nearly always cosmetic. authlint cannot know the
+   configured ACS, but the response carries the endpoint twice and the two
+   copies have to agree. */
+test('Destination and Recipient are compared', () => {
+  const ACS = 'https://sp.example.com/saml/acs';
+  const run = (d, r) => checkSamlResponse(decodeXml(samlAcs(d, r)), NOW);
+  assert.ok(has(run(ACS, ACS), 'ok', 'agree'));
+  assert.ok(has(run(ACS + '/', ACS), 'warn', 'differ only in formatting'));
+  assert.ok(has(run('https://SP.EXAMPLE.COM/saml/acs', ACS), 'warn', 'differ only in formatting'));
+  assert.ok(has(run('https://sp.example.com:443/saml/acs', ACS), 'warn', 'differ only in formatting'));
+  assert.ok(has(run(ACS, 'https://sp.example.com/saml/consume'), 'critical', 'same endpoint'));
+  assert.ok(has(run(ACS, 'https://evil.example.com/saml/acs'), 'critical', 'same endpoint'));
+});
+
+test('a malformed or plaintext ACS URL is critical', () => {
+  const ACS = 'https://sp.example.com/saml/acs';
+  const run = (d, r) => checkSamlResponse(decodeXml(samlAcs(d, r)), NOW);
+  assert.ok(has(run('sp.example.com/saml/acs', ACS), 'critical', 'not an absolute URL'));
+  assert.ok(has(run('http://sp.example.com/saml/acs', 'http://sp.example.com/saml/acs'), 'critical', 'http, not https'));
+  assert.ok(has(run(ACS + '  ', ACS), 'warn', 'whitespace'));
 });
 
 test('a missing audience restriction is critical', () => {
