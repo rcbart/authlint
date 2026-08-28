@@ -81,11 +81,17 @@ test('expired tokens are reported as a note, not a failure', () => {
   assert.ok(has(f, 'note', 'expired'));
 });
 
-test('multiple audiences without azp', () => {
-  const f = runJwt({ alg: 'RS256' }, Object.assign({}, good, { aud: ['a', 'b'] }));
-  assert.ok(has(f, 'warn', 'multiple audiences'));
-  const ok = runJwt({ alg: 'RS256' }, Object.assign({}, good, { aud: ['a', 'b'], azp: 'a' }));
-  assert.ok(!has(ok, 'warn', 'multiple audiences'));
+test('multiple audiences without azp: ID tokens only', () => {
+  // On an ID token (nonce present) the missing azp is reported.
+  const f = runJwt({ alg: 'RS256' }, Object.assign({}, good, { aud: ['a', 'b'], nonce: 'n' }));
+  assert.ok(has(f, 'note', 'multiple audiences'));
+  const ok = runJwt({ alg: 'RS256' }, Object.assign({}, good, { aud: ['a', 'b'], nonce: 'n', azp: 'a' }));
+  assert.ok(!has(ok, 'note', 'multiple audiences'));
+  // On an access token a multi-valued aud is normal (RFC 8707) and azp is an
+  // OIDC ID-token claim; grading it here was the old bug.
+  const at = runJwt({ alg: 'RS256' }, Object.assign({}, good, { aud: ['a', 'b'], scope: 'x' }));
+  assert.ok(!has(at, 'note', 'multiple audiences'));
+  assert.ok(!has(at, 'warn', 'multiple audiences'));
 });
 
 test('email as sub is flagged', () => {
@@ -564,10 +570,9 @@ test('a PEM certificate points at where certificates are checked', () => {
   assert.match(d.hint, /metadata|JWKS/);
 });
 
-test('a cookie header is recognised and explained', () => {
-  const d = diagnose('Cookie: session=abc123; path=/');
-  assert.equal(d.state, 'unknown');
-  assert.match(d.looksLike, /cookie/i);
+test('a cookie header is routed to real checks, not refused', () => {
+  assert.equal(detect('Cookie: session=abc123').kind, 'cookie');
+  assert.equal(detect('Set-Cookie: sid=abc; Path=/').kind, 'cookie');
 });
 
 test('an opaque token is called opaque rather than unrecognised', () => {

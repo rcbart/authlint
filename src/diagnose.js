@@ -13,9 +13,10 @@
    Returns { state, looksLike, problem, hint }, where state is 'malformed' when
    the shape is recognisable and 'unknown' when it is not. */
 
-const ACCEPTS = 'a JWT, a JWKS, an OpenID Connect discovery document, an OAuth ' +
-                'authorization request or redirect URL, a SAML response or assertion, ' +
-                'or SAML metadata';
+const ACCEPTS = 'a JWT (including a DPoP proof or a JWE), a JWKS, an OpenID Connect discovery ' +
+                'document, an OAuth authorization request or redirect URL, a token endpoint or ' +
+                'introspection response, a Set-Cookie header, a SAML response, assertion, ' +
+                'request or logout message, or SAML metadata';
 
 function diagnose(raw) {
   const text = String(raw || '').trim();
@@ -37,11 +38,8 @@ function diagnose(raw) {
             'will be checked in context.' };
   }
 
-  if (/^(Cookie|Set-Cookie):/i.test(text)) {
-    return { state: 'unknown', looksLike: 'an HTTP cookie header',
-      problem: 'A session cookie is usually opaque, with nothing inside it to decode.',
-      hint: 'If one of the values is a JWT, three base64url segments separated by dots, paste just that.' };
-  }
+  // Cookie headers are handled by detect() and get real findings; nothing to
+  // refuse here any more.
 
   /* ---------------- JWT, the one worth diagnosing precisely ---------------- */
 
@@ -183,9 +181,9 @@ function diagnose(raw) {
     if (decoded && /[\x00-\x08\x0e-\x1f]/.test(decoded)) {
       return { state: 'malformed', looksLike: 'compressed or binary data',
         problem: 'It is valid base64, and what comes out is not text.',
-        hint: 'SAML sent over the HTTP-Redirect binding is DEFLATE compressed, and authlint does ' +
-              'not inflate it because that would mean a dependency. Use the POST binding version, ' +
-              'which is what you want for debugging anyway.' };
+        hint: 'Redirect-binding SAML (raw DEFLATE) is inflated automatically, in the browser, so ' +
+              'seeing this message means the bytes would not inflate: the copy is probably ' +
+              'truncated. The POST binding version also works.' };
     }
     return { state: 'unknown', looksLike: 'an opaque value',
       problem: 'It looks like base64 or a random identifier, with no structure inside it.',
@@ -197,6 +195,14 @@ function diagnose(raw) {
   /* ---------------- URLs ---------------- */
 
   if (/^https?:\/\//i.test(text)) {
+    if (/[?#]/.test(text)) {
+      return { state: 'unknown', looksLike: 'a URL',
+        problem: 'It has parameters, and none of them are OAuth parameters, so there is nothing ' +
+                 'here for the authorization checks to read.',
+        hint: 'An authorization request carries response_type, client_id and friends; a callback ' +
+              'carries code or error. If this URL wraps a SAMLRequest or SAMLResponse parameter, ' +
+              'paste it whole and it is unwrapped automatically.' };
+    }
     return { state: 'malformed', looksLike: 'a URL',
       problem: 'It has no query string and no fragment, so there are no parameters to check.',
       hint: 'Copy the authorization request as the browser had it, including everything after ' +

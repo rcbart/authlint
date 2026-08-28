@@ -40,6 +40,13 @@ function decodeJwt(raw) {
   const parts = String(raw).trim().split('.');
   const out = { parts: parts.length, raw: String(raw).trim() };
   if (parts.length < 2) return { error: 'not enough segments' };
+  if (parts.length === 4 || parts.length > 5) {
+    // Previously a four-segment paste was decoded as a JWS and the fourth
+    // segment silently discarded, which reported findings about a token that
+    // did not exist. Refuse instead, and say why.
+    return { error: parts.length + ' segments: a signed JWT has three and an encrypted one has ' +
+                    'five. Check whether two values were pasted together, or a stray dot got in.' };
+  }
 
   let headerText;
   try { headerText = b64urlToText(parts[0]); }
@@ -77,22 +84,27 @@ function decodeXml(raw) {
   let text = String(raw).trim();
 
   // SAML over HTTP-POST arrives base64-encoded, and over HTTP-Redirect it is
-  // additionally deflated, which we cannot inflate without a library. Say so
-  // rather than failing silently.
+  // additionally raw-DEFLATE compressed. The browser ships an inflater
+  // (DecompressionStream), so hand the bytes back for the async path to
+  // inflate rather than turning the paste away. A percent-encoded value,
+  // which is what a copy out of a form body or a HAR looks like, is unwrapped
+  // first.
   if (!/^\s*</.test(text)) {
     let candidate = text.replace(/\s+/g, '');
+    if (/%[0-9a-fA-F]{2}/.test(candidate)) {
+      try { candidate = decodeURIComponent(candidate); } catch (e) { /* leave as pasted */ }
+    }
     if (/^[A-Za-z0-9+/=_-]+$/.test(candidate)) {
-      try {
-        const decoded = b64ToText(candidate);
-        if (/^\s*</.test(decoded)) {
-          text = decoded;
-        } else {
-          return { error: 'decoded, but the result is not XML. If this came from a ' +
-                          'redirect binding it is DEFLATE compressed, which this tool ' +
-                          'does not inflate. Grab the POST binding instead.' };
-        }
-      } catch (e) {
-        return { error: 'looks like base64 but will not decode: ' + e.message };
+      let bytes;
+      try { bytes = b64urlToBytes(candidate); }
+      catch (e) { return { error: 'looks like base64 but will not decode: ' + e.message }; }
+      const decoded = bytesToText(bytes);
+      if (/^\s*</.test(decoded)) {
+        text = decoded;
+      } else if (/[\x00-\x08\x0e-\x1f]/.test(decoded)) {
+        return { deflate: bytes };
+      } else {
+        return { error: 'decoded, but the result is not XML' };
       }
     }
   }
@@ -106,8 +118,11 @@ function decodeXml(raw) {
   return { doc, text };
 }
 
-/* Namespace-agnostic lookup. Providers disagree about prefixes, and matching
-   on localName is the only thing that works across all of them. */
+/* Prefix-agnostic lookup: providers disagree about prefixes, so elements are
+   matched on localName. That is deliberately loose, and the SAML checks close
+   the gap by verifying the namespace of the elements that matter (Assertion,
+   Signature) explicitly, because a look-alike element in a foreign namespace
+   is itself a finding rather than something to silently accept. */
 function els(node, localName) {
   if (!node) return [];
   const all = node.getElementsByTagName('*');
@@ -162,7 +177,9 @@ function certValidity(b64) {
 }
 
 /* Key size from a JWK modulus, which is what decides whether an RSA key is
-   too small to still be trusted. */
+   too small to still be trusted. Returns null when the modulus does not
+   decode, and the CALLER reports that: a swallowed decode error here once
+   meant a malformed key produced no finding at all. */
 function rsaBits(n) {
   try {
     const bytes = b64urlToBytes(n);
@@ -170,4 +187,13 @@ function rsaBits(n) {
     while (i < bytes.length && bytes[i] === 0) i++;   // strip leading zero padding
     return (bytes.length - i) * 8;
   } catch (e) { return null; }
+}
+
+/* Raw DEFLATE, the redirect binding's compression, inflated with the
+   decompressor the browser ships. No library, no network: bytes in this tab,
+   bytes out in this tab. */
+function inflateRaw(bytes) {
+  const ds = new DecompressionStream('deflate-raw');
+  const stream = new Blob([bytes]).stream().pipeThrough(ds);
+  return new Response(stream).arrayBuffer().then(buf => bytesToText(new Uint8Array(buf)));
 }

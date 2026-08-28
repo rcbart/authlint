@@ -75,6 +75,7 @@ function checkDiscovery(d, now) {
   }
 
   const rts = arr('response_types_supported').map(x => String(x).toLowerCase());
+  const grants = arr('grant_types_supported').map(x => String(x).toLowerCase());
   const implicit = rts.filter(x => /\btoken\b/.test(x) && !/^code$/.test(x));
   if (implicit.length) {
     f.push(F('warn', 'Implicit flow is still enabled: ' + implicit.join(', '),
@@ -82,8 +83,39 @@ function checkDiscovery(d, now) {
       'and in anything that logs URLs. It has been advised against for years and it is usually left ' +
       'on for one forgotten legacy client.',
       'Find out who still uses it, move them to code with PKCE, and turn it off.', 'RFC 9700 §2.1.2'));
+  } else if (grants.includes('implicit')) {
+    f.push(F('warn', 'Implicit is enabled via grant_types_supported',
+      'The response types look clean, and the grant list still advertises implicit. The two halves ' +
+      'of this document disagree, and clients read both.',
+      'Remove implicit from grant_types_supported too.', 'RFC 9700 §2.1.2'));
   } else if (rts.length) {
-    f.push(F('ok', 'No implicit response types', ''));
+    f.push(F('ok', 'No implicit flow advertised', ''));
+  }
+
+  /* The grant list is where the worst findings in a real discovery document
+     live, and it is the half of the document that mostly goes unread. */
+  if (grants.includes('password')) {
+    f.push(F('critical', 'The password grant (ROPC) is enabled',
+      'The client collects the user\'s password and replays it, which trains users to type ' +
+      'credentials into applications and gives the authorization server no way to do MFA, ' +
+      'phishing-resistance or risk decisions. The current best practice is blunt: it MUST NOT ' +
+      'be used.',
+      'Find the clients still on it, move them to the code flow, and disable it.', 'RFC 9700 §2.4'));
+  }
+  if (grants.some(g => /jwt-bearer/.test(g))) {
+    f.push(F('note', 'JWT bearer grant is enabled',
+      'Tokens are issued for externally-signed assertions. Legitimate for federation, and every ' +
+      'issuer key trusted for it is a token-minting key: worth knowing exactly which those are.',
+      '', 'RFC 7523'));
+  }
+
+  const roAlgs = arr('request_object_signing_alg_values_supported').map(x => String(x).toLowerCase());
+  if (roAlgs.includes('none')) {
+    f.push(F('warn', 'Unsigned request objects are accepted (request_object_signing_alg none)',
+      'A JAR request object exists to make the authorization request tamper-evident. Accepting ' +
+      'unsigned ones hands an attacker a structured way to assert request parameters, with more ' +
+      'authority than a plain query string.',
+      'Remove none from the request object algorithms.', 'RFC 9101'));
   }
 
   const algs = arr('id_token_signing_alg_values_supported').map(x => String(x).toLowerCase());
@@ -105,9 +137,20 @@ function checkDiscovery(d, now) {
       'Fine for confidential clients. Worth knowing which of your clients are actually confidential, ' +
       'because a secret shipped inside a SPA or a mobile binary is not one.', '', 'RFC 9700 §2.5'));
   }
+  if (tea.includes('none')) {
+    f.push(F('note', 'Unauthenticated token requests are supported (auth method "none")',
+      'Public clients redeem codes without authenticating, which is normal for SPAs and native ' +
+      'apps, and it means PKCE is the only thing standing between a stolen code and a token.',
+      'Make sure PKCE is enforced, not just supported, for every public client.', 'RFC 9700 §2.1.1'));
+  }
   if (tea.includes('private_key_jwt') || tea.includes('tls_client_auth')) {
     f.push(F('ok', 'Strong client authentication available: ' +
       tea.filter(x => /private_key_jwt|tls_client_auth/.test(x)).join(', '), ''));
+  }
+  if (d.authorization_response_iss_parameter_supported === true) {
+    f.push(F('ok', 'Issuer identification on authorization responses (RFC 9207) is advertised',
+      'Clients can verify which issuer answered, which is the structural defense against mix-up ' +
+      'attacks across providers.', '', 'RFC 9207 §3'));
   }
 
   if (!d.end_session_endpoint) {
@@ -146,7 +189,7 @@ function checkJwks(j, now) {
     f.push(F('critical', secret.length + ' symmetric key(s) in a key set',
       'A JWKS is a public document. An oct key is a shared secret, and its value is right there in ' +
       'the k parameter. If this document is served from a well-known URL, the secret is public.',
-      'Remove it now and rotate it. Assume it is compromised.', 'RFC 7517 §8.1'));
+      'Remove it now and rotate it. Assume it is compromised.', 'RFC 7517 §9.2'));
   }
 
   const priv = keys.filter(k => k && (k.d || k.p || k.q));
@@ -174,11 +217,16 @@ function checkJwks(j, now) {
 
     if (String(k.kty).toUpperCase() === 'RSA' && k.n) {
       const bits = rsaBits(k.n);
-      if (bits && bits < 2048) {
+      if (bits == null) {
+        f.push(F('warn', 'RSA modulus does not decode' + (k.kid ? ' (' + k.kid + ')' : ''),
+          'The n parameter is not valid base64url, so no verifier can use this key, and a check ' +
+          'that swallows the decode error reports nothing at all. This one does not.',
+          'Fix the key material at the source.', 'RFC 7518 §6.3.1'));
+      } else if (bits < 2048) {
         f.push(F('critical', 'RSA key is ' + bits + ' bits' + (k.kid ? ' (' + k.kid + ')' : ''),
           'Below the minimum anyone still considers safe.',
           'Rotate to at least 2048 bits.', 'RFC 7518 §3.3'));
-      } else if (bits) {
+      } else {
         f.push(F('ok', 'RSA ' + bits + ' bits' + (k.kid ? ' (' + k.kid + ')' : ''), ''));
       }
     }
@@ -186,6 +234,11 @@ function checkJwks(j, now) {
     if (Array.isArray(k.x5c) && k.x5c[0]) {
       const v = certValidity(k.x5c[0]);
       if (v) {
+        if (v.notBefore && now * 1000 < v.notBefore.getTime()) {
+          f.push(F('warn', 'Certificate is not valid yet' + (k.kid ? ' (' + k.kid + ')' : ''),
+            'notBefore is in the future, so chain validators reject it right now and the failure ' +
+            'reads as a bad signature rather than a date problem.', 'Check the rotation.'));
+        }
         const days = (v.notAfter - now * 1000) / 86400000;
         if (days < 0) {
           f.push(F('critical', 'Certificate expired ' + Math.abs(Math.round(days)) + ' days ago' +

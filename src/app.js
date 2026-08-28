@@ -22,6 +22,30 @@ function analyze(input) {
   }
   const text = d.rewrite || input;
 
+  // A SAML document extracted from a URL parameter: decide what the decoded
+  // value is and analyze that. One level of recursion, by construction.
+  if (d.kind === 'samlparam') {
+    return analyze(text);
+  }
+
+  if (d.kind === 'cookie') {
+    return {
+      kind: /^set-cookie:/im.test(text) ? 'Set-Cookie response header' : 'Cookie request header',
+      decoded: '<pre class="code">' + esc(text) + '</pre>',
+      findings: checkCookie(text, now),
+    };
+  }
+
+  if (d.kind === 'tokenresp') {
+    const j = JSON.parse(text);
+    return {
+      kind: typeof j.active === 'boolean' ? 'Token introspection response' : 'Token endpoint response',
+      decoded: renderJson(j),
+      findings: checkTokenResponse(j, now),
+      also: nestedJwts(j),
+    };
+  }
+
   if (d.kind === 'jwt') {
     const t = decodeJwt(text);
     if (t.error) return { error: t.error, kind: d.kind };
@@ -29,6 +53,18 @@ function analyze(input) {
       kind: t.kind === 'jwe' ? 'Encrypted JWT (JWE)' : describeJwt(t),
       decoded: renderJwt(t),
       findings: checkJwt(t, now),
+    };
+  }
+
+  if (d.kind === 'samllogout' || d.kind === 'samlreq') {
+    const x = decodeXml(text);
+    if (x.error) return { error: x.error };
+    if (x.deflate) return { deflate: x.deflate };
+    return {
+      kind: d.kind === 'samlreq' ? 'SAML authentication request'
+          : 'SAML logout message (' + x.doc.documentElement.localName + ')',
+      decoded: renderXml(x.text),
+      findings: d.kind === 'samlreq' ? checkSamlAuthnRequest(x, now) : checkSamlLogout(x, now),
     };
   }
 
@@ -59,19 +95,66 @@ function analyze(input) {
       decoded: renderParams(a),
       findings: checkAuthz(a, now),
       also: nestedJwts(a.params),
+      hashParams: a.params,
     };
   }
 
   const x = decodeXml(text);
   if (x.error) return { error: x.error };
+  if (x.deflate) return { deflate: x.deflate };
   if (d.kind === 'samlmeta') {
     return { kind: 'SAML metadata', decoded: renderXml(x.text), findings: checkSamlMetadata(x, now) };
   }
   return {
-    kind: d.kind === 'samlreq' ? 'SAML authentication request' : 'SAML response',
+    kind: 'SAML response',
     decoded: renderXml(x.text),
     findings: checkSamlResponse(x, now),
   };
+}
+
+/* ---------------- the one verification that needs no key ----------------
+   at_hash and c_hash are the left half of a hash of the access token and the
+   code, under the hash of the ID token's own alg. When a redirect carries
+   both halves, the claim is checkable right here, offline: WebCrypto digests
+   bytes in this tab and nothing leaves it. This is the difference between
+   "authlint cannot verify without the key" and not verifying what it can. */
+function verifyOidcHashes(params) {
+  const results = [];
+  const idt = params && params.id_token;
+  if (!idt || typeof crypto === 'undefined' || !crypto.subtle) return Promise.resolve(results);
+  const t = decodeJwt(idt);
+  if (t.error || t.kind !== 'jws' || !t.payload) return Promise.resolve(results);
+  const m = String(t.header.alg || '').match(/(256|384|512)$/);
+  if (!m) return Promise.resolve(results);
+  const sha = 'SHA-' + m[1];
+
+  const jobs = [];
+  for (const [claim, artifact, label, ref] of [
+      ['at_hash', params.access_token, 'access token', 'OIDC Core §3.2.2.9'],
+      ['c_hash', params.code, 'authorization code', 'OIDC Core §3.3.2.10']]) {
+    const expected = t.payload[claim];
+    if (!expected || !artifact) continue;
+    jobs.push(crypto.subtle.digest(sha, new TextEncoder().encode(String(artifact))).then(buf => {
+      const digest = new Uint8Array(buf);
+      const half = digest.slice(0, digest.length / 2);
+      let bin = '';
+      for (let i = 0; i < half.length; i++) bin += String.fromCharCode(half[i]);
+      const got = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      if (got === String(expected)) {
+        results.push(F('ok', claim + ' verifies against the ' + label + ' in this redirect',
+          'Computed here, offline: ' + sha + ' over the ' + label + ', left half, base64url. No ' +
+          'key needed, nothing sent anywhere.', '', ref));
+      } else {
+        results.push(F('critical', claim + ' does NOT match the ' + label + ' in this redirect',
+          'The ID token was issued alongside a different ' + label + ' than the one riding next ' +
+          'to it. That is what token substitution looks like: someone swapped one artifact in a ' +
+          'response whose other half they kept.',
+          'Reject the response. If you are debugging, confirm both values came from the same ' +
+          'redirect.', ref));
+      }
+    }).catch(() => { /* a digest that cannot run is simply not reported */ }));
+  }
+  return Promise.all(jobs).then(() => results);
 }
 
 /* A redirect often carries an id_token worth checking on its own. */
@@ -85,9 +168,11 @@ function nestedJwts(params) {
 }
 
 function describeJwt(t) {
-  const p = t.payload || {};
-  if (p.nonce || p.at_hash || p.auth_time) return 'OpenID Connect ID token';
-  if (p.scope || p.scp) return 'OAuth 2.0 access token (JWT)';
+  const prof = jwtProfile(t);
+  if (prof === 'dpop') return 'DPoP proof';
+  if (prof === 'logout') return 'OIDC back-channel logout token';
+  if (prof === 'id') return 'OpenID Connect ID token';
+  if (prof === 'at') return 'OAuth 2.0 access token (JWT)';
   return 'JSON Web Token';
 }
 
@@ -127,17 +212,27 @@ function timeClaims(p) {
 }
 
 function renderParams(a) {
+  const dups = a.dups || {};
   const rows = Object.keys(a.params).map(k => {
-    const v = String(a.params[k]);
-    const shown = v.length > 300 ? v.slice(0, 300) + '…' : v;
-    return '<tr><td>' + esc(k) + '</td><td><code>' + esc(shown) + '</code></td></tr>';
+    const vals = dups[k] || [a.params[k]];
+    const shown = vals.map(v => {
+      const s = String(v);
+      return s.length > 300 ? s.slice(0, 300) + '…' : s;
+    });
+    // Every copy of a duplicated parameter is displayed, because the copy the
+    // provider honoured may not be the last one, and hiding the others hides
+    // the attack.
+    return '<tr><td>' + esc(k) + (vals.length > 1 ? ' <b>×' + vals.length + '</b>' : '') +
+           '</td><td><code>' + shown.map(esc).join('</code><br><code>') + '</code></td></tr>';
   }).join('');
   return (a.base ? '<p class="dim">Endpoint: <code>' + esc(a.base) + '</code></p>' : '') +
          '<table class="params"><tbody>' + rows + '</tbody></table>';
 }
 
 function renderXml(text) {
-  return '<pre class="code">' + esc(prettyXml(text)) + '</pre>';
+  return '<p class="dim">Re-indented for reading. Whitespace differs from the pasted original, ' +
+         'which matters if you are eyeballing byte-exact values: trust the findings, not the ' +
+         'indentation.</p><pre class="code">' + esc(prettyXml(text)) + '</pre>';
 }
 
 /* Indentation only. Nothing here reorders or rewrites the document, because
@@ -202,9 +297,10 @@ function renderDiagnosis(input, fallback) {
 }
 
 const ACCEPTED_SENTENCE =
-  'authlint reads JSON Web Tokens, JWKS documents, OpenID Connect discovery documents, OAuth ' +
-  'authorization requests and redirects, SAML responses and assertions, and SAML metadata. SAML ' +
-  'over the redirect binding is DEFLATE compressed and needs the POST binding version.';
+  'authlint reads JSON Web Tokens (including DPoP proofs and JWEs), JWKS documents, OpenID ' +
+  'Connect discovery documents, OAuth authorization requests and redirects, token endpoint and ' +
+  'introspection responses, Set-Cookie headers, SAML responses, assertions, requests, logout ' +
+  'messages and metadata. Redirect-binding SAML is inflated automatically, in the browser.';
 
 function counts(list) {
   const c = { critical: 0, warn: 0, note: 0, ok: 0 };
@@ -214,7 +310,7 @@ function counts(list) {
 
 /* ------------------------------ wiring ------------------------------ */
 
-function run() {
+async function run() {
   const input = $('in').value.trim();
   const out = $('out');
   if (!input) { out.innerHTML = ''; $('summary').innerHTML = ''; return; }
@@ -222,6 +318,35 @@ function run() {
   let r;
   try { r = analyze(input); }
   catch (e) { r = { error: 'authlint fell over on this input: ' + e.message }; }
+
+  /* Redirect-binding SAML: the bytes came back compressed, so inflate them
+     with the browser's own decompressor and analyze what comes out. Async
+     because DecompressionStream is, and still entirely inside this tab. */
+  if (r && r.deflate) {
+    try {
+      const inflated = await inflateRaw(r.deflate);
+      if (/^\s*</.test(inflated)) {
+        r = analyze(inflated);
+        if (r && !r.error) {
+          r.kind = (r.kind || '') + ' (inflated from the redirect binding)';
+        }
+      } else {
+        r = { error: 'inflated, but the result is not XML' };
+      }
+    } catch (e) {
+      r = { error: 'looks like compressed data but will not inflate. If it came from a ' +
+                   'redirect binding it may be truncated; the POST binding version also works.' };
+    }
+  }
+
+  /* The key-free cryptographic checks: at_hash and c_hash, when a redirect
+     carries both the ID token and the artifact it hashes. */
+  if (r && !r.error && r.hashParams) {
+    try {
+      const extra = await verifyOidcHashes(r.hashParams);
+      if (extra.length) r.findings = sortFindings((r.findings || []).concat(extra));
+    } catch (e) { /* verification that cannot run is simply not reported */ }
+  }
 
   if (r.error) {
     $('summary').innerHTML = '';
@@ -253,7 +378,7 @@ function run() {
       const t = decodeJwt(n.value);
       if (t.error) return '';
       const nf = checkJwt(t, nowSeconds());
-      return '<section class="findings nested"><h3>' + esc(n.name) + ' inside this redirect</h3>' +
+      return '<section class="findings nested"><h3>' + esc(n.name) + ', decoded and checked separately</h3>' +
              renderFindings(nf) + '</section>';
     }).join('');
   }

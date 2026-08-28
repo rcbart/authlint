@@ -17,6 +17,7 @@ const SCRIPTS = [
   'src/checks-oidc.js',
   'src/checks-oauth.js',
   'src/checks-saml.js',
+  'src/checks-http.js',
   'src/samples.js',
   'src/app.js',
 ];

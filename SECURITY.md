@@ -30,10 +30,19 @@ Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline';
 ```
 
 `default-src 'none'` with `connect-src 'none'` means the browser refuses every
-outbound request regardless of what the JavaScript tries. A future edit that
-introduced a leak would be blocked by the browser, not merely disapproved of in
-review. `test/security.browser.js` proves this by attempting a real `fetch` and
-a real image beacon and asserting both are blocked.
+subresource and background request — fetch, XHR, beacon, WebSocket, images,
+fonts, workers — regardless of what the JavaScript tries. A future edit that
+introduced that kind of leak would be blocked by the browser, not merely
+disapproved of in review. `test/security.browser.js` proves this by attempting
+a real `fetch` and a real image beacon and asserting both are blocked.
+
+Stated honestly: CSP does not govern top-level navigation, so a script that
+navigated the page to another site would not be stopped by this header. That
+path is covered differently: nothing in the file navigates, the history
+methods are trapped at load, the static gate fails on any assignment to
+`location`, and the file is short enough to read. "The browser refuses" is the
+mechanism for requests; for navigation the mechanism is that the code
+provably never does it.
 
 ### Nothing is retained
 
@@ -145,8 +154,15 @@ existing is the point.
 and other applications can read it.
 
 **Signature verification.** authlint does not verify signatures, because that
-needs a key and keys need the network. **A result with no findings does not mean
+needs a key and keys need the network. The checkable exceptions are checked:
+`at_hash` and `c_hash` are verified locally with WebCrypto, which digests
+bytes in the tab and sends nothing. **A result with no findings does not mean
 a token is genuine.** Verify in your own code, with the algorithm pinned.
+
+**In-browser processing additions.** Redirect-binding SAML is inflated with
+`DecompressionStream`, the decompressor the browser ships: bytes in this tab,
+bytes out in this tab, no library, no request. Both this and the WebCrypto
+digests run under the same CSP and the same gates as everything else.
 
 ## Reporting something
 

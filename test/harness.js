@@ -16,12 +16,16 @@ const FILES = [
   'src/checks-oidc.js',
   'src/checks-oauth.js',
   'src/checks-saml.js',
+  'src/checks-http.js',
 ];
 
 const sandbox = {
   atob, btoa, TextDecoder, TextEncoder, URL, URLSearchParams,
   Date, Math, JSON, Object, Array, String, Number, RegExp, isNaN, parseInt, parseFloat,
-  console,
+  console, Promise, Uint8Array,
+  // Node ships these globals too, so the inflate path is testable here.
+  Blob, Response, DecompressionStream,
+  crypto: globalThis.crypto,
   // Node has no DOMParser. This is the only reason the test harness has a
   // dependency at all, and nothing in dist/index.html uses it.
   DOMParser,

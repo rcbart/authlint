@@ -290,7 +290,10 @@ never want to say in an incident review, whatever the website was.
 
 **It does not verify signatures.** This is the important one. Verifying needs the
 key, the key needs the network, and the network breaks the only promise the tool
-makes. Every result says so.
+makes. Every result says so. The checkable exceptions are checked: `at_hash` and
+`c_hash` need only the artifacts riding in the same redirect, and they are
+verified locally with WebCrypto — a match is a pass, a mismatch is what token
+substitution looks like.
 
 What this means in practice: authlint can tell you a token *claims* `RS256` and
 carries a `kid`. It cannot tell you the signature is valid. **A token with no
@@ -298,9 +301,12 @@ findings may still be forged.** Verify in your own code, with the algorithm
 pinned to what you expect rather than read from the header, against a key set
 you fetched yourself.
 
-**It does not inflate the SAML redirect binding.** Redirect-binding SAML is
-DEFLATE compressed, and inflating it would mean a dependency. Use the POST
-binding version, which is what you want for debugging anyway.
+**It inflates the SAML redirect binding in the browser.** Redirect-binding SAML
+is raw-DEFLATE compressed, and the browser ships a decompressor
+(`DecompressionStream`), so pasting the parameter value — or the whole SSO URL —
+works. No dependency, no request: bytes in the tab, bytes out in the tab. If
+inflation fails, the copy is usually truncated, and the POST binding version
+also works.
 
 **It does not decrypt.** A JWE header is readable and its payload is not. An
 `EncryptedAssertion` is reported as encrypted, which is a pass, and its contents
@@ -337,7 +343,7 @@ two seconds from the fix:
 | The payload decodes, but the result is not valid JSON | Truncated part way through. The tool shows you what did come out. |
 | It parses, but it is not a shape authlint knows | Valid JSON of the wrong kind. Its top-level keys are listed so you can see what you actually have. |
 | It has no query string | An authorization URL copied without everything after the `?`. Tick **Preserve log** in the network tab first. |
-| It is valid base64, and what comes out is not text | Redirect-binding SAML, which is DEFLATE compressed. Get the POST binding version. |
+| It is valid base64, and what comes out is not text | Compressed bytes that would not inflate — usually a truncated copy of a redirect-binding value. Recopy it, or use the POST binding version. |
 
 **Red: "authlint does not recognise this."**
 
@@ -348,8 +354,9 @@ rather than a shrug, because they are things people reasonably try:
   the expiry gets checked in context.
 - **A PEM private key.** Refused, and you should not be pasting one into
   anything.
-- **A cookie header.** Session cookies are opaque. If one of the values is a JWT,
-  paste just that value.
+- **A cookie header.** Now read rather than refused: `Set-Cookie` gets attribute
+  findings (Secure, HttpOnly, SameSite, prefixes), and a request-side `Cookie`
+  header is explained. A JWT riding in a cookie value can also be pasted alone.
 - **An opaque token.** Nothing to decode, by design. Only the issuer's
   introspection endpoint can tell you anything about it.
 - **Anything else.** It lists what it does read.

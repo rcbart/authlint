@@ -4,11 +4,17 @@
    this one line, and almost nobody reads it. */
 
 function parseAuthz(text, asQuery) {
-  const out = { params: {}, base: '', fragment: false, scheme: '' };
+  const out = { params: {}, dups: {}, base: '', fragment: false, scheme: '' };
+  const put = (k, v) => {
+    if (k in out.params && out.params[k] !== v) {
+      (out.dups[k] = out.dups[k] || [out.params[k]]).push(v);
+    }
+    out.params[k] = v;
+  };
   let s = String(text).trim();
 
   if (asQuery) {
-    for (const [k, v] of new URLSearchParams(s.replace(/^[?&]/, ''))) out.params[k] = v;
+    for (const [k, v] of new URLSearchParams(s.replace(/^[?&]/, ''))) put(k, v);
     return out;
   }
 
@@ -16,11 +22,11 @@ function parseAuthz(text, asQuery) {
   try { u = new URL(s); } catch (e) { return { error: 'not a URL: ' + e.message }; }
   out.base = u.origin + u.pathname;
   out.scheme = u.protocol.replace(':', '');
-  for (const [k, v] of u.searchParams) out.params[k] = v;
+  for (const [k, v] of u.searchParams) put(k, v);
   if (u.hash && u.hash.length > 1) {
     out.fragment = true;
     for (const [k, v] of new URLSearchParams(u.hash.slice(1))) {
-      out.params[k] = v;
+      put(k, v);
       out.fragmentParams = out.fragmentParams || {};
       out.fragmentParams[k] = v;
     }
@@ -35,6 +41,17 @@ function checkAuthz(a, now) {
 
   /* A redirect carrying results, rather than a request. Different checks matter. */
   const isCallback = !!(p.code || p.access_token || p.id_token || p.error);
+
+  /* ---------------- parameter pollution, before anything trusts p ---------------- */
+  for (const k of Object.keys(a.dups || {})) {
+    const vals = a.dups[k];
+    f.push(F('critical', 'Parameter "' + k + '" appears ' + vals.length + ' times with different values',
+      'OAuth forbids repeating a parameter, because implementations disagree about which copy ' +
+      'wins: first, last, or concatenated. An attacker exploits exactly that disagreement, and ' +
+      'the copy your provider honoured may not be the copy you are reading. Values seen: ' +
+      vals.map(v => String(v).slice(0, 80)).join('  |  '),
+      'Reject requests with duplicated parameters.', 'RFC 6749 §3.1'));
+  }
 
   if (a.scheme === 'http' && !/^https?:\/\/(localhost|127\.0\.0\.1)/.test(a.base)) {
     f.push(F('critical', 'Plaintext http',
@@ -83,15 +100,26 @@ function checkAuthz(a, now) {
       f.push(F('ok', 'PKCE with S256', ''));
     }
 
+    /* state and CSRF. PKCE covers CSRF when the client completes the code
+       exchange and verifies it, so the two absences mean different things. */
     if (!p.state) {
-      f.push(F('warn', 'No state parameter',
-        'Nothing binds the callback to the browser session that started it, which is what makes ' +
-        'login CSRF possible. PKCE does not cover this.',
-        'Send an unguessable state and check it on return.', 'RFC 6749 §10.12'));
-    } else if (String(p.state).length < 8) {
-      f.push(F('warn', 'state is only ' + String(p.state).length + ' characters',
-        'Short enough to guess, which defeats the point of having it.',
-        'Use at least 128 bits of randomness.'));
+      if (!p.code_challenge) {
+        f.push(F('warn', 'No state and no PKCE',
+          'Nothing binds the callback to the browser session that started it, which is what makes ' +
+          'login CSRF possible.',
+          'Send PKCE (which covers CSRF when the exchange is verified) or an unguessable state ' +
+          'checked on return.', 'RFC 9700 §2.1, RFC 6749 §10.12'));
+      } else {
+        f.push(F('note', 'No state parameter',
+          'With PKCE present and verified at the token exchange, CSRF is covered and state is ' +
+          'application routing rather than a required security parameter. It is still the usual ' +
+          'place to carry "where do I send the user back to".',
+          '', 'RFC 9700 §2.1'));
+      }
+    } else if (String(p.state).length < 16 && !p.code_challenge) {
+      f.push(F('warn', 'state is only ' + String(p.state).length + ' characters and is doing CSRF duty',
+        'Without PKCE, state is the CSRF defense, and a short value is guessable.',
+        'Use at least 128 bits of randomness, or add PKCE.', 'RFC 6749 §10.12'));
     } else {
       f.push(F('ok', 'state present', ''));
     }
@@ -132,7 +160,7 @@ function checkAuthz(a, now) {
         'If the provider honours it, an attacker picks the destination the code is delivered to.',
         'Register exact URIs. No wildcards, no prefixes.', 'RFC 9700 §2.1'));
     }
-    if (/^http:/i.test(r) && !/^http:\/\/(localhost|127\.0\.0\.1)/i.test(r)) {
+    if (/^http:/i.test(r) && !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(r)) {
       f.push(F('critical', 'redirect_uri is plaintext http: ' + r,
         'The code is delivered over a channel anyone on the path can read.', 'Use https.', 'RFC 9700 §2.1'));
     }
@@ -146,6 +174,42 @@ function checkAuthz(a, now) {
         'Deprecated, and the copy-paste step is exactly where users get phished.',
         'Use a loopback redirect for native applications.', 'RFC 9700 §2.1'));
     }
+    /* The exact-match bypass shapes. A wildcard is the amateur version; these
+       are what a real bypass attempt looks like, and a provider that matches
+       loosely falls to one of them long before it falls to a "*". */
+    let ru = null;
+    try { ru = new URL(r); } catch (e) { /* non-URL redirect handled above */ }
+    if (ru && (ru.username || ru.password)) {
+      f.push(F('critical', 'redirect_uri has userinfo in the authority: ' + r,
+        'Everything before the @ is credentials, not the host. A validator that matches on ' +
+        '"starts with https://app.example.com" reads the wrong host, and the browser delivers ' +
+        'the code to what comes after the @.',
+        'Reject redirect URIs containing @.', 'RFC 9700 §4.1'));
+    }
+    if (/\\/.test(r)) {
+      f.push(F('warn', 'redirect_uri contains a backslash',
+        'Browsers treat \\ as / in URLs; many server-side parsers do not. Every disagreement ' +
+        'between the validator\'s parser and the browser\'s is a bypass.',
+        'Reject it.', 'RFC 9700 §4.1'));
+    }
+    if (/\/\.\.(\/|$)|%2e%2e/i.test(r)) {
+      f.push(F('warn', 'redirect_uri contains path traversal: ' + r,
+        'If the provider normalises the path after matching, the code is delivered somewhere other ' +
+        'than the registered path.',
+        'Match the registered URI byte for byte, after normalising exactly once.', 'RFC 9700 §4.1'));
+    }
+    if (ru && /[?&](url|next|redirect|return|dest|goto|continue)=(https?%3a|https?:)/i.test(ru.search)) {
+      f.push(F('warn', 'redirect_uri carries a nested URL in its query: ' + ru.search.slice(0, 80),
+        'A forwarding parameter inside the registered redirect target is an open redirect one hop ' +
+        'later: the provider delivers the code to the right page, and that page hands it on.',
+        'Do not put open redirectors inside registered redirect URIs.', 'RFC 9700 §4.11'));
+    }
+    if (ru && !/^https?:$/.test(ru.protocol)) {
+      f.push(F('note', 'redirect_uri uses a custom scheme: ' + ru.protocol,
+        'Normal for native apps, and claimable: on several platforms any app can register the same ' +
+        'scheme and receive the code. Loopback or claimed https links are the stronger options.',
+        '', 'RFC 8252 §8.1'));
+    }
   } else if (!isCallback) {
     f.push(F('note', 'No redirect_uri in the request',
       'Legal when the client has exactly one registered URI, and a source of confusion when it does not.'));
@@ -158,7 +222,21 @@ function checkAuthz(a, now) {
         (p.error_description ? ': ' + p.error_description : ''),
         'The description is the provider\'s, not authlint\'s.'));
     }
-    if (p.code) f.push(F('ok', 'Authorization code returned on the front channel, as intended', ''));
+    if (p.code) {
+      f.push(F('ok', 'Authorization code returned on the front channel, as intended', ''));
+      if (p.iss) {
+        f.push(F('ok', 'Callback carries iss: ' + p.iss,
+          'The issuer identification parameter. A client that compares this against the issuer it ' +
+          'started with cannot be caught by a mix-up across providers.', '', 'RFC 9207 §2'));
+      } else {
+        f.push(F('note', 'Callback carries no iss parameter',
+          'With more than one provider configured, a client cannot tell which issuer this code came ' +
+          'from, which is the opening for mix-up attacks. Providers that support RFC 9207 return ' +
+          'iss on every authorization response.',
+          'If the provider advertises authorization_response_iss_parameter_supported, verify iss here.',
+          'RFC 9207 §2, RFC 9700 §4.4.2.1'));
+      }
+    }
     if (p.access_token) {
       f.push(F('critical', 'An access token came back in the URL',
         'It is now in the browser history and in any referrer header this page emits.',
@@ -166,7 +244,8 @@ function checkAuthz(a, now) {
     }
     if (!p.state && !p.error) {
       f.push(F('warn', 'Callback carries no state',
-        'Nothing to compare against what you sent, so the CSRF check cannot happen.', '', 'RFC 6749 §10.12'));
+        'Nothing to compare against what you sent. If the request used PKCE the CSRF risk is ' +
+        'covered at the exchange; if it did not, this callback is unbound.', '', 'RFC 9700 §2.1'));
     }
   }
 

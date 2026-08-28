@@ -4,22 +4,18 @@
    they are holding, and half the time they are not sure.
 
    Order matters: the cheapest and most certain shapes are tested first, and
-   anything ambiguous falls through to a guess with a stated confidence. */
-
-const KINDS = {
-  jwt:       'JSON Web Token',
-  jwks:      'JSON Web Key Set',
-  discovery: 'OpenID Connect discovery document',
-  authz:     'OAuth 2.0 authorization request',
-  samlresp:  'SAML response',
-  samlreq:   'SAML authentication request',
-  samlmeta:  'SAML metadata',
-  saml:      'SAML document',
-};
+   anything that stays ambiguous is handed to diagnose(), which explains
+   rather than guesses. */
 
 function detect(raw) {
   const text = String(raw || '').trim();
   if (!text) return { kind: null };
+
+  // Cookie headers, either direction. The value is usually opaque; the
+  // attributes are the artifact.
+  if (/^(set-cookie|cookie):/im.test(text)) {
+    return { kind: 'cookie' };
+  }
 
   // A bearer header pasted whole, which people do constantly. This must be
   // tested BEFORE the bare-JWT shape below: that test strips whitespace so a
@@ -28,27 +24,50 @@ function detect(raw) {
   // other way round, a bare Bearer paste matches as a JWT with no rewrite and
   // the prefix is carried into the decoder.
   const bearer = text.match(/^(?:Authorization:\s*)?Bearer\s+([A-Za-z0-9_.-]+)$/i);
-  if (bearer) return { kind: 'jwt', confidence: 'certain', rewrite: bearer[1] };
+  if (bearer) return { kind: 'jwt', rewrite: bearer[1] };
 
-  // A JWT is three or five base64url segments.
+  // A JWT is three base64url segments, an encrypted one five. Four segments
+  // still get routed to the decoder, which refuses them with a reason a
+  // person can act on; swallowing the extra segment would be worse.
   if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]*){1,3}$/.test(text.replace(/\s+/g, ''))) {
-    return { kind: 'jwt', confidence: 'certain' };
+    return { kind: 'jwt' };
   }
 
-  // A URL: either an authorization request or a redirect carrying the result.
+  // A URL. Only an OAuth one: a URL with a query string is not automatically
+  // an authorization request, and grading a search link for missing PKCE
+  // helped nobody. A redirect-binding SSO URL carries the SAML document in a
+  // parameter, so unwrap that first.
   if (/^https?:\/\//i.test(text) && /[?#]/.test(text)) {
-    return { kind: 'authz', confidence: 'certain' };
+    const saml = text.match(/[?&](SAMLResponse|SAMLRequest|LogoutRequest|LogoutResponse)=([^&#\s]+)/i);
+    if (saml) {
+      let v = saml[2];
+      try { v = decodeURIComponent(v); } catch (e) { /* use as-is */ }
+      return { kind: 'samlparam', rewrite: v };
+    }
+    if (/[?#&](response_type|client_id|redirect_uri|scope|state|code|access_token|id_token|error|code_challenge|iss|token_type)=/i.test(text)) {
+      return { kind: 'authz' };
+    }
+    return { kind: null, reason: 'a URL with parameters, none of which are OAuth parameters. ' +
+                                 'authlint reads authorization requests and redirects.' };
   }
 
   // JSON: which document depends on what is inside it.
   if (/^[\[{]/.test(text)) {
     try {
       const j = JSON.parse(text);
-      if (j && Array.isArray(j.keys)) return { kind: 'jwks', confidence: 'certain' };
+      if (j && Array.isArray(j.keys)) return { kind: 'jwks' };
       if (j && (j.issuer || j.authorization_endpoint || j.jwks_uri)) {
-        return { kind: 'discovery', confidence: 'certain' };
+        return { kind: 'discovery' };
       }
-      if (j && (j.kty || j.n || j.crv)) return { kind: 'jwks', confidence: 'likely', wrapSingleKey: true };
+      // The token endpoint's answer, or an introspection response: the two
+      // most-pasted JSON artifacts in any OAuth debugging session.
+      if (j && (j.access_token || j.refresh_token ||
+                (j.token_type && j.expires_in != null) || j.id_token)) {
+        return { kind: 'tokenresp' };
+      }
+      if (j && typeof j.active === 'boolean') return { kind: 'tokenresp' };
+      if (j && (j.error && (j.error_description || j.error_uri))) return { kind: 'tokenresp' };
+      if (j && (j.kty || j.n || j.crv)) return { kind: 'jwks' };
       return { kind: null, reason: 'JSON, but not a shape authlint knows' };
     } catch (e) {
       return { kind: null, reason: 'starts like JSON but will not parse: ' + e.message };
@@ -56,26 +75,45 @@ function detect(raw) {
   }
 
   // XML, either raw or base64. Look at the root element to tell them apart.
+  // Logout messages are tested before the generic Response match, because
+  // LogoutResponse IS a "*Response" and used to be graded with sign-on
+  // response rules, which produced nonsense findings on it.
   const xmlish = /^\s*</.test(text) ? text : peekBase64Xml(text);
   if (xmlish) {
     if (/<[\w:]*EntityDescriptor/i.test(xmlish) || /<[\w:]*EntitiesDescriptor/i.test(xmlish)) {
-      return { kind: 'samlmeta', confidence: 'certain' };
+      return { kind: 'samlmeta' };
     }
-    if (/<[\w:]*Response/i.test(xmlish)) return { kind: 'samlresp', confidence: 'certain' };
-    if (/<[\w:]*AuthnRequest/i.test(xmlish)) return { kind: 'samlreq', confidence: 'certain' };
-    if (/<[\w:]*Assertion/i.test(xmlish)) return { kind: 'samlresp', confidence: 'likely' };
     if (/<[\w:]*LogoutRequest/i.test(xmlish) || /<[\w:]*LogoutResponse/i.test(xmlish)) {
-      return { kind: 'saml', confidence: 'likely' };
+      return { kind: 'samllogout' };
     }
+    if (/<[\w:]*AuthnRequest/i.test(xmlish)) return { kind: 'samlreq' };
+    if (/<[\w:]*Response/i.test(xmlish)) return { kind: 'samlresp' };
+    if (/<[\w:]*Assertion/i.test(xmlish)) return { kind: 'samlresp' };
     // Parses as XML but the root is not one of the SAML elements. Running the
     // SAML checks over it would produce a page of findings about a document
     // that was never SAML, so hand it to diagnose instead.
     return { kind: null, reason: 'XML, but not a document authlint knows' };
   }
 
+  // Long base64 that decodes to bytes rather than text: the redirect
+  // binding's raw-DEFLATE payload. Only the binary case routes here; base64
+  // of readable text falls through to diagnose, which explains it better.
+  const blob = text.replace(/\s+/g, '');
+  if (/^[A-Za-z0-9+/=_%-]{40,}$/.test(blob)) {
+    let peek = null;
+    try {
+      let c = blob;
+      if (/%[0-9a-fA-F]{2}/.test(c)) { try { c = decodeURIComponent(c); } catch (e) {} }
+      peek = b64urlToText(c.slice(0, Math.floor(Math.min(c.length, 400) / 4) * 4));
+    } catch (e) { /* not base64 after all */ }
+    if (peek && /[\x00-\x08\x0e-\x1f]/.test(peek)) {
+      return { kind: 'samlresp', maybeDeflate: true };
+    }
+  }
+
   // A bare query string, which is what you get from copying out of a HAR file.
   if (/(^|[?&])(response_type|client_id|redirect_uri|code_challenge)=/.test(text)) {
-    return { kind: 'authz', confidence: 'likely', asQuery: true };
+    return { kind: 'authz', asQuery: true };
   }
 
   return { kind: null, reason: 'authlint cannot tell what this is' };

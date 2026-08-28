@@ -6,11 +6,13 @@
 
 ![authlint showing findings on a broken SAML response](docs/findings.png)
 
-authlint reads JSON Web Tokens, JWKS documents, OpenID Connect discovery
-documents, OAuth 2.0 authorization requests and redirects, SAML responses and
-SAML metadata. You do not tell it which one you have. It works that out, decodes
-it, and then does the part the other tools skip: it tells you what is wrong, why
-that matters, and what to change.
+authlint reads JSON Web Tokens (including DPoP proofs and JWEs), JWKS documents,
+OpenID Connect discovery documents, OAuth 2.0 authorization requests and
+redirects, token endpoint and introspection responses, `Set-Cookie` headers,
+SAML responses, requests, logout messages and metadata — redirect-binding SAML
+included, inflated in the browser. You do not tell it which one you have. It
+works that out, decodes it, and then does the part the other tools skip: it
+tells you what is wrong, why that matters, and what to change.
 
 **Nothing leaves your browser.** No network calls, no storage, no analytics, no
 build step. One HTML file that works with the network unplugged, because people
@@ -35,36 +37,67 @@ milliseconds, so the token expires in the year 57000. Or that the JWKS you are
 serving to the public internet contains an `oct` key, and the shared secret is
 sitting in the `k` parameter.
 
-Those are the findings that cost people weekends. authlint has about sixty of
-them.
+Those are the findings that cost people weekends. authlint has about a hundred
+of them, and each kind of token is graded by its own rules: a DPoP proof, an ID
+token, an access token and a logout token are different artifacts with
+different required claims, and a checker that grades one by another's rules
+produces confident nonsense.
 
 ## What it checks
 
 **JWTs.** `alg: none` and symmetric-signing confusion. `jku`, `x5u` and `jwk`
-headers, which invite the verifier to fetch the key the token nominates.
-Millisecond timestamps. Lifetimes measured in weeks. Missing `iss`, `aud` or
-`exp`. Multiple audiences with no `azp`. Email addresses used as `sub`. Personal
-data in a payload that is base64 rather than encryption. Tokens large enough to
-break a header limit for whichever user has collected the most groups.
+headers, which nominate the key that validates their own token. Millisecond
+timestamps, and string timestamps that make validators fail open. Lifetimes
+measured in weeks. Missing `iss`, `aud` or `exp`, and a trailing slash on `iss`.
+An ID token with multiple audiences and no `azp`. Email addresses used as
+`sub`. Bearer tokens with no `cnf` binding. Personal data in a payload that is
+base64 rather than encryption. Tokens large enough to break a header limit for
+whichever user has collected the most groups. DPoP proofs get proof rules:
+required `jti`/`htm`/`htu`/`iat`, the embedded key checked for private
+parameters, and no complaints about the `exp` and `aud` they rightly lack.
 
 **JWKS.** Symmetric or private key material in a document meant to be public.
 Duplicate `kid` values. RSA keys under 2048 bits. Certificates about to expire.
 
 **OpenID Connect discovery.** Missing or plain-only PKCE. Implicit flows nobody
-remembers enabling. `none` in the supported ID token algorithms. Plaintext
-`jwks_uri`. Trailing-slash issuer mismatches, which cost more debugging hours
-than any other single character in this field.
+remembers enabling — in the response types and in `grant_types_supported`,
+which is where they hide. ROPC still on. Unsigned request objects. `none` in
+the supported ID token algorithms. Plaintext `jwks_uri`. Trailing-slash issuer
+mismatches, which cost more debugging hours than any other single character in
+this field.
 
-**OAuth authorization requests and redirects.** Missing `state` or PKCE. Wildcard
-or plaintext redirect URIs. A client secret traveling through the browser. An
-ID token requested with no `nonce`. Tokens arriving in a URL fragment.
+**OAuth authorization requests and redirects.** Missing PKCE, and the honest
+version of the `state` story: with PKCE verified at the exchange, CSRF is
+covered and a missing `state` is a note, not a scare. Duplicated parameters,
+every copy shown. Wildcard, plaintext and look-alike redirect URIs — userinfo
+`@` tricks, path traversal, nested open redirectors. A client secret traveling
+through the browser. An ID token requested with no `nonce`. Tokens arriving in
+a URL fragment. Callbacks without the RFC 9207 `iss`. And when a redirect
+carries an ID token beside its access token or code, `at_hash` and `c_hash`
+are **verified**, offline, with WebCrypto — the one cryptographic check that
+needs no key.
 
-**SAML.** Which element the signature actually covers. Multiple assertions and
-duplicate `ID` attributes, which is what signature wrapping looks like. Missing
-`AudienceRestriction`, so the assertion is replayable at any service provider
-that trusts the same IdP. Four-hour validity windows. SHA-1 digests. Email
-addresses as `NameID`. Certificates expiring on a weekend. In metadata:
-`WantAssertionsSigned="false"` and plaintext endpoints.
+**Token endpoint and introspection responses.** Missing `token_type` or
+`expires_in`, `Bearer` casing that breaks string-matching clients, refresh
+tokens without a rotation story, inactive introspection responses that leak
+everything the token used to be.
+
+**Set-Cookie.** Missing `Secure` or `HttpOnly`, `SameSite=None` without
+`Secure` (the browser drops it, silently), broken `__Host-` prefix contracts,
+month-long session cookies, JWTs riding in cookies.
+
+**SAML.** Which element the signature actually covers — each `Reference` is
+resolved, so a signature that points at an element other than the one it lives
+in, the mechanism of signature wrapping, is reported directly, alongside its
+symptoms: multiple assertions, duplicate `ID` attributes, XPath transforms,
+look-alike elements in foreign namespaces. Missing `AudienceRestriction`.
+Bearer confirmations with no expiry and responses whose `InResponseTo` the
+assertion does not echo. Timestamps with no timezone, parsed as the UTC the
+spec requires rather than as local time. Four-hour validity windows. SHA-1
+digests. Email addresses as `NameID`. Certificates expiring on a weekend, or
+not yet valid. Requests and logout messages get their own rules instead of
+being graded as responses. In metadata: `WantAssertionsSigned="false"`,
+plaintext endpoints, and whether the metadata itself is signed.
 
 **Anything else you paste.** A free box gets fed everything, and "cannot tell
 what this is" is a useless answer to somebody holding a token that nearly works.
@@ -73,21 +106,19 @@ a JWT but seems malformed* and names the fault: which segment is short, which on
 is not base64url, which one decoded to something that is not JSON, that the JSON
 parses but is the wrong shape, that a URL has no query string. If the shape is
 not recognisable, it says so plainly and lists what it does read, with a specific
-answer for the things people reasonably try anyway: a PEM certificate, a private
-key, a cookie header, an opaque token, DEFLATE-compressed redirect-binding SAML.
+answer for the things people reasonably try anyway: a PEM certificate, a
+private key, an opaque token, a URL that is not an OAuth URL.
 
 ## What it does not do
 
-**It does not verify signatures.** That needs the key, and fetching keys means
-network calls, which would break the only promise this tool makes. Everything
-here is about what a token says and how it is assembled, never about whether it
-is authentic. Verify in your own code, with the algorithm pinned, against a key
-set you fetched yourself. authlint says so on every result, because a tool that
-lets people think otherwise is worse than no tool.
-
-**It does not inflate the redirect binding.** SAML sent over HTTP-Redirect is
-DEFLATE compressed, and inflating it would mean a dependency. Use the POST
-binding version.
+**It does not verify signatures.** That needs the key, and retrieving keys
+means network calls, which would break the only promise this tool makes. The
+checkable exceptions are checked: `at_hash` and `c_hash` need only the
+artifacts themselves and are verified locally. Everything else is about what a
+token says and how it is assembled, never about whether it is authentic.
+Verify in your own code, with the algorithm pinned, against a key set you
+fetched yourself. authlint says so on every result, because a tool that lets
+people think otherwise is worse than no tool.
 
 ## Build and test
 
@@ -96,7 +127,7 @@ harness, because Node has no `DOMParser`, and none of it ships.
 
 ```
 npm ci
-npm test                      # 46 tests against the files in src/
+npm test                      # 115 tests against the files in src/
 node build.js                 # src/ -> dist/index.html
 node scripts/verify-dist.js   # dist is current, self-contained, no network calls
 ```

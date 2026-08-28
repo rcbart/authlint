@@ -7,12 +7,15 @@
 <meta name="description" content="Paste a JWT, a SAML response or assertion, an OpenID Connect discovery document, a JWKS or an OAuth authorization request. authlint works out which it is, decodes it and tells you what is wrong, why it matters and what to change. One HTML file, no dependencies, nothing leaves your browser.">
 <meta name="color-scheme" content="light">
 <!-- The privacy claim, enforced by the browser rather than asserted by the author.
-     default-src 'none' means no network destination of any kind is permitted:
+     default-src 'none' means no subresource or background request is permitted:
      no fetch, no XHR, no beacon, no websocket, no image, no font, no worker.
      If a future edit introduced one, it would fail here instead of leaking.
      form-action 'none' stops any submission, base-uri 'none' stops a <base>
      rewrite. frame-ancestors cannot be set from a meta tag, so there is a
-     script guard for that further down. -->
+     script guard for that further down. Honest limit: CSP does not govern
+     top-level navigation, so "the browser refuses" covers requests, not a
+     script that navigates away; nothing here navigates, the history methods
+     are trapped, and the source is short enough to check that. -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; manifest-src 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="index, follow">
@@ -44,9 +47,9 @@
     <p class="tag">Paste any artifact from an authentication flow, decode it, and see what is wrong with it.</p>
     <p class="privacy">
       <b>Nothing leaves your browser.</b> No network calls, no storage, no analytics, and a
-      Content-Security-Policy of <code>default-src 'none'</code> so the browser enforces that
-      rather than taking my word for it. Your input never enters the URL, so it never reaches
-      your history. Spellcheck and grammar extensions are opted out, because those read text
+      Content-Security-Policy of <code>default-src 'none'</code> so the browser refuses every
+      subresource and background request — fetch, XHR, beacon, WebSocket — rather than taking my
+      word for it. Your input never enters the URL, so it never reaches your history. Spellcheck and grammar extensions are opted out, because those read text
       boxes and send what they find upstream. The box is emptied when you leave the page.
       <a href="https://github.com/rcbart/authlint/blob/main/SECURITY.md" rel="noopener noreferrer external">How this is verified</a>.
     </p>
@@ -71,7 +74,7 @@
     <textarea id="in" spellcheck="false" autocomplete="off" autocapitalize="off"
       autocorrect="off" data-gramm="false" data-gramm_editor="false"
       data-enable-grammarly="false" data-1p-ignore data-lpignore="true" data-form-type="other"
-      placeholder="A JWT, an OpenID Connect discovery document, a JWKS, an OAuth authorization request or redirect URL, a SAML response, or SAML metadata. authlint works out which."></textarea>
+      placeholder="A JWT or DPoP proof, a discovery document, a JWKS, an OAuth authorization request or redirect URL, a token endpoint response, a Set-Cookie header, a SAML response, request or metadata document. authlint works out which."></textarea>
     <div id="summary" class="summary"></div>
   </section>
 
@@ -81,34 +84,47 @@
     <h2>What it checks</h2>
     <div class="grid">
       <div>
-        <h3>JWTs and JWKS</h3>
-        <p>Algorithm confusion and <code>alg: none</code>. Header fields that ask the verifier to
-        fetch a key from somewhere the token chose. Lifetimes measured in weeks. Millisecond
-        timestamps that push expiry into the next millennium. Personal data riding in a payload that
-        is base64, not encryption. Tokens that will not survive a header limit once one user
-        accumulates enough groups. Symmetric keys published in a document meant to be public.</p>
+        <h3>JWTs, DPoP and JWKS</h3>
+        <p>Algorithm confusion and <code>alg: none</code>. Header fields that nominate the key that
+        validates their own token. Lifetimes measured in weeks, string timestamps that make
+        validators fail open, millisecond timestamps that push expiry into the next millennium.
+        Personal data riding in a payload that is base64, not encryption. Tokens that will not
+        survive a header limit once one user accumulates enough groups. Symmetric keys published in
+        a document meant to be public. And each kind of token graded by its own rules: a DPoP proof,
+        an ID token, an access token and a logout token are different artifacts with different
+        required claims.</p>
       </div>
       <div>
         <h3>OpenID Connect and OAuth</h3>
-        <p>Discovery documents advertising no PKCE, implicit flows nobody remembers enabling, and
-        unsigned ID tokens. Authorization requests missing <code>state</code> or a challenge, with a
-        wildcard redirect, or carrying a client secret through the browser. Trailing-slash issuer
-        mismatches, which cost more debugging hours than any other single character in this field.</p>
+        <p>Discovery documents advertising no PKCE, ROPC and implicit still enabled in the grant
+        list, and unsigned ID tokens. Authorization requests with a wildcard or look-alike redirect,
+        duplicated parameters, or a client secret in the browser. Redirects missing the RFC&nbsp;9207
+        <code>iss</code>. Token endpoint responses and Set-Cookie headers. Trailing-slash issuer
+        mismatches, in the discovery document and in the token, which cost more debugging hours than
+        any other single character in this field. And when a redirect carries an ID token beside its
+        access token or code, <code>at_hash</code> and <code>c_hash</code> are actually verified,
+        offline — the one cryptographic check that needs no key.</p>
       </div>
       <div>
         <h3>SAML</h3>
-        <p>Whether the assertion is signed or only the response is, which is the difference between
-        a working federation and signature wrapping. Multiple assertions and duplicate IDs. Missing
-        audience restrictions, four-hour validity windows, SHA-1 digests, email addresses used as
-        durable identifiers, and certificates that expire the weekend nobody is on call.</p>
+        <p>Whether the assertion is signed or only the response is, and what each signature actually
+        covers: the Reference is resolved, so a signature pointing at an element other than the one
+        it lives in — the mechanism of signature wrapping — is reported directly, alongside multiple
+        assertions, duplicate IDs, XPath transforms and look-alike elements in foreign namespaces.
+        Missing audience restrictions, bearer confirmations without expiry, timestamps with no
+        timezone, four-hour validity windows, SHA-1 digests, email addresses as durable identifiers,
+        and certificates that expire the weekend nobody is on call. Requests, logout messages and
+        metadata get their own rules, and redirect-binding payloads are inflated in the browser.</p>
       </div>
     </div>
 
     <h2>What it does not do</h2>
-    <p>It does not verify signatures. That needs the key, and fetching keys means network calls,
-    which would break the one promise this tool makes. Everything here is about what a token says
-    and how it is put together, never about whether it is genuine. Verify in your own code, with
-    the algorithm pinned, against a key set you fetched yourself.</p>
+    <p>It does not verify signatures. That needs the key, and retrieving keys means network calls,
+    which would break the one promise this tool makes. The checkable exceptions are checked:
+    <code>at_hash</code> and <code>c_hash</code> need only the artifacts themselves, and they are
+    verified locally with WebCrypto. Everything else is about what a token says and how it is put
+    together, never about whether it is genuine. Verify in your own code, with the algorithm
+    pinned, against a key set you fetched yourself.</p>
 
     <h2>Why it exists</h2>
     <p>Every tool of this kind is run by a vendor, on their servers, and people paste production

@@ -109,9 +109,13 @@ const SAMPLES = {
 
   jwks: JSON.stringify({
     keys: [
+      // A real, decodable 1024-bit modulus (the key size finding is part of
+      // the demo). The previous sample's modulus was 145 characters, which is
+      // not valid base64url, so the RSA size check silently never ran on it.
       { kty: 'RSA', use: 'sig', kid: 'rotation-2024', alg: 'RS256', e: 'AQAB',
-        n: 'sVJ0Zn3nqvJ7pQx2vN1kLwYyR8mFtHc0dGvBpKzXaQwErTyUiOpAsDfGhJkLzXcVbNmQwErTyUi' +
-           'OpAsDfGhJkLzXcVbNmQwErTyUiOpAsDfGhJkLzXcVbNmQwErTyUiOpAsDfGhJkLzXcVbNm' },
+        n: '97w2NJVvczC2FffTqfAWGry44eB-gNkuofgqYOSy_3EP93jk8C7HJy5T6pta7KXWD0Uq1KZNhFIs' +
+           'HrNxwKTsesb_3umKNuRkAuCVOefKF-kogbVxvksQ7ZOVyUytDa4sgg35XWeDDhx6NI6qQCGRGSdn' +
+           'lqPiO_axGHzq5-t9eMk' },
       { kty: 'oct', use: 'sig', kid: 'legacy-hmac', alg: 'HS256',
         k: 'c3VwZXItc2VjcmV0LXNoYXJlZC1rZXktZG8tbm90LXB1Ymxpc2g' },
     ],
